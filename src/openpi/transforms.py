@@ -245,6 +245,33 @@ class AbsoluteActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class MaskStateActionDims(DataTransformFn):
+    """Masks selected state/action dimensions to fixed constants."""
+
+    state_indices: Sequence[int] = ()
+    action_indices: Sequence[int] = ()
+    state_value: float = 0.0
+    action_value: float = 0.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.state_indices and "state" in data:
+            state = data["state"]
+            for idx in self.state_indices:
+                if -state.shape[-1] <= idx < state.shape[-1]:
+                    state[..., idx] = self.state_value
+            data["state"] = state
+
+        if self.action_indices and "actions" in data:
+            actions = data["actions"]
+            for idx in self.action_indices:
+                if -actions.shape[-1] <= idx < actions.shape[-1]:
+                    actions[..., idx] = self.action_value
+            data["actions"] = actions
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False

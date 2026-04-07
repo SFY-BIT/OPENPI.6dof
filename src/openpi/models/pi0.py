@@ -1,4 +1,5 @@
 import logging
+import os
 
 import einops
 import flax.nnx as nnx
@@ -14,6 +15,7 @@ import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
+DEBUG_NONFINITE = os.environ.get("OPENPI_DEBUG_NONFINITE") == "1"
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -61,6 +63,32 @@ def posemb_sincos(
         precision=jax.lax.Precision.HIGHEST,
     )
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
+
+
+def _debug_nonfinite_tensor(name: str, value):
+    if not DEBUG_NONFINITE:
+        return value
+
+    if not jnp.issubdtype(value.dtype, jnp.inexact):
+        return value
+
+    finite = jnp.all(jnp.isfinite(value))
+
+    def _log(_):
+        value_f32 = value.astype(jnp.float32)
+        finite_mask = jnp.isfinite(value_f32)
+        safe_abs = jnp.where(finite_mask, jnp.abs(value_f32), 0.0)
+        jax.debug.print(
+            "NONFINITE {name}: shape={shape} nan={nan} inf={inf} max_abs={max_abs}",
+            name=name,
+            shape=value.shape,
+            nan=jnp.sum(jnp.isnan(value_f32)),
+            inf=jnp.sum(jnp.isinf(value_f32)),
+            max_abs=jnp.max(safe_abs),
+        )
+
+    jax.lax.cond(finite, lambda _: None, _log, operand=None)
+    return value
 
 
 class Pi0(_model.BaseModel):
@@ -112,6 +140,7 @@ class Pi0(_model.BaseModel):
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            _debug_nonfinite_tensor(f"image_tokens[{name}]", image_tokens)
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -127,6 +156,7 @@ class Pi0(_model.BaseModel):
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            _debug_nonfinite_tensor("tokenized_inputs", tokenized_inputs)
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
@@ -191,17 +221,29 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        _debug_nonfinite_tensor("observation.state", observation.state)
+        for image_name, image in observation.images.items():
+            _debug_nonfinite_tensor(f"observation.images[{image_name}]", image)
+        _debug_nonfinite_tensor("actions", actions)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        _debug_nonfinite_tensor("noise", noise)
+        _debug_nonfinite_tensor("time", time)
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+        _debug_nonfinite_tensor("x_t", x_t)
+        _debug_nonfinite_tensor("u_t", u_t)
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        _debug_nonfinite_tensor("prefix_tokens", prefix_tokens)
+        _debug_nonfinite_tensor("suffix_tokens", suffix_tokens)
+        if adarms_cond is not None:
+            _debug_nonfinite_tensor("adarms_cond", adarms_cond)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -209,9 +251,17 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
+        _debug_nonfinite_tensor("suffix_out", suffix_out)
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        _debug_nonfinite_tensor("v_t", v_t)
+        residual = v_t - u_t
+        _debug_nonfinite_tensor("v_t_minus_u_t", residual)
+        squared_residual = jnp.square(residual)
+        _debug_nonfinite_tensor("squared_v_t_minus_u_t", squared_residual)
+        loss_chunk = jnp.mean(squared_residual, axis=-1)
+        _debug_nonfinite_tensor("loss_chunk", loss_chunk)
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return loss_chunk
 
     @override
     def sample_actions(

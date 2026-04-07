@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -81,6 +82,57 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     )
 
 
+def _tree_all_finite(pytree) -> jax.Array:
+    leaves = jax.tree.leaves(pytree)
+    if not leaves:
+        return jnp.asarray(True)
+    return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in leaves]))
+
+
+def _summarize_array(name: str, value: Any) -> str:
+    array = np.asarray(jax.device_get(value))
+    finite_mask = np.isfinite(array) if np.issubdtype(array.dtype, np.number) else None
+    parts = [f"{name}: shape={array.shape}, dtype={array.dtype}"]
+    if finite_mask is not None:
+        parts.append(f" finite={bool(finite_mask.all())}")
+        parts.append(f" nan={int(np.isnan(array).sum())}")
+        parts.append(f" inf={int(np.isinf(array).sum())}")
+        finite_values = array[finite_mask]
+        if finite_values.size:
+            parts.append(
+                " min={:.6g} max={:.6g} mean={:.6g}".format(
+                    float(finite_values.min()),
+                    float(finite_values.max()),
+                    float(finite_values.mean()),
+                )
+            )
+    return "".join(parts)
+
+
+def _summarize_batch(batch: tuple[_model.Observation, _model.Actions]) -> str:
+    observation, actions = batch
+    summaries = []
+    summaries.append(_summarize_array("observation.state", observation.state))
+    summaries.append(_summarize_array("actions", actions))
+    for name, image in observation.images.items():
+        summaries.append(_summarize_array(f"observation.images[{name}]", image))
+    for name, image_mask in observation.image_masks.items():
+        summaries.append(_summarize_array(f"observation.image_masks[{name}]", image_mask))
+    return "\n".join(summaries)
+
+
+def _describe_debug_batch(raw_dataset, batch_size: int, batch_idx: int) -> str:
+    sample_start = batch_idx * batch_size
+    sample_end = sample_start + batch_size
+    episode_ids = [int(raw_dataset[i]["episode_index"]) for i in range(sample_start, sample_end)]
+    frame_ids = [int(raw_dataset[i]["frame_index"]) for i in range(sample_start, sample_end)]
+    return (
+        f"samples=[{sample_start},{sample_end}) "
+        f"episodes=[{min(episode_ids)},{max(episode_ids)}] "
+        f"frames=[{min(frame_ids)},{max(frame_ids)}]"
+    )
+
+
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
@@ -156,7 +208,17 @@ def train_step(
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    grad_norm = optax.global_norm(grads)
+    finite_update = jnp.isfinite(loss) & jnp.isfinite(grad_norm) & _tree_all_finite(grads)
 
+    current_kernel_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
@@ -165,12 +227,20 @@ def train_step(
     nnx.update(model, new_params)
     new_params = nnx.state(model)
 
-    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+    new_state = dataclasses.replace(
+        state,
+        step=state.step + 1,
+        params=jax.tree.map(lambda new, old: jnp.where(finite_update, new, old), new_params, state.params),
+        opt_state=jax.tree.map(lambda new, old: jnp.where(finite_update, new, old), new_opt_state, state.opt_state),
+    )
     if state.ema_decay is not None:
+        updated_ema_params = jax.tree.map(
+            lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+        )
         new_state = dataclasses.replace(
             new_state,
             ema_params=jax.tree.map(
-                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+                lambda new, old: jnp.where(finite_update, new, old), updated_ema_params, state.ema_params
             ),
         )
 
@@ -183,10 +253,12 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+    param_norm = jnp.where(finite_update, optax.global_norm(kernel_params), optax.global_norm(current_kernel_params))
     info = {
         "loss": loss,
-        "grad_norm": optax.global_norm(grads),
-        "param_norm": optax.global_norm(kernel_params),
+        "grad_norm": grad_norm,
+        "param_norm": param_norm,
+        "skipped_nonfinite": 1.0 - finite_update.astype(jnp.float32),
     }
     return new_state, info
 
@@ -217,10 +289,28 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    data_config = config.data.create(config.assets_dirs, config.model)
+
+    debug_disable_shuffle = os.environ.get("OPENPI_DEBUG_DISABLE_SHUFFLE") == "1"
+    if debug_disable_shuffle:
+        logging.warning("OPENPI_DEBUG_DISABLE_SHUFFLE=1, disabling data shuffling for reproducible debugging")
+
+    debug_batch_meta_steps = int(os.environ.get("OPENPI_DEBUG_BATCH_META_STEPS", "0"))
+    debug_raw_dataset = None
+    debug_batches_per_epoch = None
+    if debug_batch_meta_steps > 0 and debug_disable_shuffle and data_config.rlds_data_dir is None:
+        debug_raw_dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
+        effective_len = len(debug_raw_dataset) - (len(debug_raw_dataset) % config.batch_size)
+        debug_batches_per_epoch = effective_len // config.batch_size if effective_len > 0 else None
+        logging.warning(
+            "OPENPI_DEBUG_BATCH_META_STEPS=%s, logging deterministic batch metadata for the first steps",
+            debug_batch_meta_steps,
+        )
+
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
-        shuffle=True,
+        shuffle=not debug_disable_shuffle,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
@@ -256,10 +346,38 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    reported_nonfinite = False
     for step in pbar:
+        if (
+            debug_raw_dataset is not None
+            and debug_batches_per_epoch is not None
+            and step < debug_batch_meta_steps
+        ):
+            batch_in_epoch = step % debug_batches_per_epoch
+            logging.warning(
+                "Debug batch meta at loop_step=%s: %s",
+                step,
+                _describe_debug_batch(debug_raw_dataset, config.batch_size, batch_in_epoch),
+            )
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
+        skipped_nonfinite = float(jax.device_get(info["skipped_nonfinite"]))
+        if skipped_nonfinite > 0.0 and not reported_nonfinite:
+            batch_meta = ""
+            if debug_raw_dataset is not None and debug_batches_per_epoch is not None:
+                batch_in_epoch = step % debug_batches_per_epoch
+                batch_meta = _describe_debug_batch(debug_raw_dataset, config.batch_size, batch_in_epoch)
+            logging.warning(
+                "Detected non-finite train step at loop_step=%s train_state_step=%s loss=%s grad_norm=%s%s\n%s",
+                step,
+                int(jax.device_get(train_state.step)),
+                float(jax.device_get(info["loss"])),
+                float(jax.device_get(info["grad_norm"])),
+                f" batch_meta=({batch_meta})" if batch_meta else "",
+                _summarize_batch(batch),
+            )
+            reported_nonfinite = True
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
