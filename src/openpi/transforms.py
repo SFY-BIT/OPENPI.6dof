@@ -213,7 +213,8 @@ class DeltaActions(DataTransformFn):
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state = np.array(data["state"], copy=False)
+        actions = np.array(data["actions"], copy=True)
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
@@ -235,7 +236,8 @@ class AbsoluteActions(DataTransformFn):
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state = np.array(data["state"], copy=False)
+        actions = np.array(data["actions"], copy=True)
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
@@ -255,14 +257,14 @@ class MaskStateActionDims(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         if self.state_indices and "state" in data:
-            state = data["state"]
+            state = np.array(data["state"], copy=True)
             for idx in self.state_indices:
                 if -state.shape[-1] <= idx < state.shape[-1]:
                     state[..., idx] = self.state_value
             data["state"] = state
 
         if self.action_indices and "actions" in data:
-            actions = data["actions"]
+            actions = np.array(data["actions"], copy=True)
             for idx in self.action_indices:
                 if -actions.shape[-1] <= idx < actions.shape[-1]:
                     actions[..., idx] = self.action_value
