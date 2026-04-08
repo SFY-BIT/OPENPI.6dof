@@ -62,6 +62,25 @@ def _extract_first_action(action_chunk: Any) -> np.ndarray:
     return action_chunk[0].astype(np.float32)
 
 
+def _extract_action_chunk(action_chunk: Any) -> np.ndarray:
+    action_chunk = _to_numpy(action_chunk).astype(np.float32)
+    if action_chunk.ndim == 1:
+        return action_chunk[None, :]
+    if action_chunk.ndim != 2:
+        raise ValueError(f"Expected action chunk rank 1 or 2, got shape {action_chunk.shape}")
+    return action_chunk
+
+
+def _read_current_state(robot: Any, expected_state_dim: int) -> np.ndarray:
+    if not hasattr(robot, "arm") or not hasattr(robot.arm, "read"):
+        raise AttributeError("Piper remote client expects the robot runtime to expose robot.arm.read().")
+
+    state = np.asarray(list(robot.arm.read().values()), dtype=np.float32)
+    if expected_state_dim > 0 and state.shape[0] != expected_state_dim:
+        raise ValueError(f"Expected {expected_state_dim}-D robot state, got {state.shape[0]}")
+    return state
+
+
 def _clamp_action_delta(
     target_action: np.ndarray,
     current_state: np.ndarray,
@@ -185,26 +204,45 @@ def main() -> None:
         "Applying joint3mask execution rule: action[%s] will be replaced with the current joint value.",
         args.hold_joint_index,
     )
+    logging.info("Action chunks will be executed sequentially before the next server inference request.")
 
     robot.connect()
     try:
         start_t = time.perf_counter()
         step_idx = 0
+        pending_actions: np.ndarray | None = None
+        pending_action_index = 0
+        latest_policy_timing: dict[str, Any] = {}
+        latest_server_timing: dict[str, Any] = {}
 
         while time.perf_counter() - start_t < args.duration_s:
             loop_start_t = time.perf_counter()
+            infer_requested = False
 
-            observation = robot.capture_observation()
-            policy_observation = _build_policy_observation(
-                observation,
-                args.task,
-                args.image_size,
-                args.expected_state_dim,
-            )
-            current_state = np.asarray(policy_observation["observation/state"], dtype=np.float32)
+            if pending_actions is None or pending_action_index >= len(pending_actions):
+                observation = robot.capture_observation()
+                policy_observation = _build_policy_observation(
+                    observation,
+                    args.task,
+                    args.image_size,
+                    args.expected_state_dim,
+                )
+                current_state = np.asarray(policy_observation["observation/state"], dtype=np.float32)
 
-            policy_result = policy.infer(policy_observation)
-            action = _extract_first_action(policy_result["actions"])
+                policy_result = policy.infer(policy_observation)
+                pending_actions = _extract_action_chunk(policy_result["actions"])
+                pending_action_index = 0
+                latest_policy_timing = policy_result.get("policy_timing", {})
+                latest_server_timing = policy_result.get("server_timing", {})
+                infer_requested = True
+                logging.info("Fetched action chunk with %s steps from the policy server.", len(pending_actions))
+            else:
+                current_state = _read_current_state(robot, args.expected_state_dim)
+
+            action = np.array(pending_actions[pending_action_index], copy=True)
+            chunk_step = pending_action_index + 1
+            chunk_size = len(pending_actions)
+            pending_action_index += 1
 
             if action.shape != current_state.shape:
                 raise ValueError(
@@ -237,11 +275,14 @@ def main() -> None:
 
             loop_dt_ms = (time.perf_counter() - loop_start_t) * 1000
             logging.info(
-                "step=%s loop_dt_ms=%.2f server_ms=%s policy_ms=%s",
+                "step=%s chunk_step=%s/%s infer_requested=%s loop_dt_ms=%.2f server_ms=%s policy_ms=%s",
                 step_idx,
+                chunk_step,
+                chunk_size,
+                infer_requested,
                 loop_dt_ms,
-                policy_result.get("server_timing", {}).get("infer_ms"),
-                policy_result.get("policy_timing", {}).get("infer_ms"),
+                latest_server_timing.get("infer_ms"),
+                latest_policy_timing.get("infer_ms"),
             )
 
             if executed_action.shape == safe_action.shape and not np.allclose(executed_action, safe_action):
