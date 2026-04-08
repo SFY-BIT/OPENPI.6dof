@@ -155,6 +155,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-s", type=float, default=60.0, help="How long to run the control loop.")
     parser.add_argument("--robot-type", default="piper", help="Robot type exposed by lerobot.act.")
     parser.add_argument(
+        "--chunk-execute-steps",
+        type=int,
+        default=5,
+        help="Maximum number of actions to execute from each returned action chunk before refreshing from the server.",
+    )
+    parser.add_argument(
         "--image-size",
         type=int,
         default=224,
@@ -204,7 +210,10 @@ def main() -> None:
         "Applying joint3mask execution rule: action[%s] will be replaced with the current joint value.",
         args.hold_joint_index,
     )
-    logging.info("Action chunks will be executed sequentially before the next server inference request.")
+    logging.info(
+        "Action chunks will be executed sequentially before the next server inference request (max %s steps).",
+        args.chunk_execute_steps,
+    )
 
     robot.connect()
     try:
@@ -231,6 +240,8 @@ def main() -> None:
 
                 policy_result = policy.infer(policy_observation)
                 pending_actions = _extract_action_chunk(policy_result["actions"])
+                if args.chunk_execute_steps > 0:
+                    pending_actions = pending_actions[: args.chunk_execute_steps]
                 pending_action_index = 0
                 latest_policy_timing = policy_result.get("policy_timing", {})
                 latest_server_timing = policy_result.get("server_timing", {})
@@ -274,13 +285,15 @@ def main() -> None:
             executed_action = _to_numpy(executed_action).astype(np.float32)
 
             loop_dt_ms = (time.perf_counter() - loop_start_t) * 1000
+            control_hz = 1000.0 / loop_dt_ms if loop_dt_ms > 0 else float("inf")
             logging.info(
-                "step=%s chunk_step=%s/%s infer_requested=%s loop_dt_ms=%.2f server_ms=%s policy_ms=%s",
+                "step=%s chunk_step=%s/%s infer_requested=%s loop_dt_ms=%.2f control_hz=%.2f server_ms=%s policy_ms=%s",
                 step_idx,
                 chunk_step,
                 chunk_size,
                 infer_requested,
                 loop_dt_ms,
+                control_hz,
                 latest_server_timing.get("infer_ms"),
                 latest_policy_timing.get("infer_ms"),
             )
