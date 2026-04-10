@@ -110,6 +110,26 @@ def _clamp_action_delta(
     return clamped, was_clamped
 
 
+def _low_pass_action(
+    target_action: np.ndarray,
+    previous_action: np.ndarray | None,
+    *,
+    alpha: float,
+) -> tuple[np.ndarray, bool]:
+    if previous_action is None or alpha >= 1.0:
+        return np.array(target_action, copy=True), False
+    if alpha <= 0.0:
+        return np.array(previous_action, copy=True), not np.allclose(previous_action, target_action)
+    if target_action.shape != previous_action.shape:
+        raise ValueError(
+            f"Target action shape {target_action.shape} does not match previous action shape {previous_action.shape}"
+        )
+
+    filtered = ((1.0 - alpha) * previous_action) + (alpha * target_action)
+    filtered = filtered.astype(np.float32, copy=False)
+    return filtered, not np.allclose(filtered, target_action)
+
+
 def _build_policy_observation(
     observation: dict[str, Any],
     task: str,
@@ -157,7 +177,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk-execute-steps",
         type=int,
-        default=5,
+        default=1,
         help="Maximum number of actions to execute from each returned action chunk before refreshing from the server.",
     )
     parser.add_argument(
@@ -193,11 +213,22 @@ def _parse_args() -> argparse.Namespace:
         default=0.02,
         help="Maximum per-step absolute change for the gripper target relative to the current state.",
     )
+    parser.add_argument(
+        "--action-filter-alpha",
+        type=float,
+        default=0.35,
+        help=(
+            "Low-pass smoothing weight applied to the final robot command. "
+            "Use a value in (0, 1]; smaller values are smoother, 1 disables filtering."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    if not 0.0 <= args.action_filter_alpha <= 1.0:
+        raise ValueError(f"--action-filter-alpha must be in [0, 1], got {args.action_filter_alpha}")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -214,6 +245,13 @@ def main() -> None:
         "Action chunks will be executed sequentially before the next server inference request (max %s steps).",
         args.chunk_execute_steps,
     )
+    if args.action_filter_alpha < 1.0:
+        logging.info(
+            "Low-pass action filter enabled with alpha=%.3f (smaller is smoother, 1 disables filtering).",
+            args.action_filter_alpha,
+        )
+    else:
+        logging.info("Low-pass action filter disabled (alpha=%.3f).", args.action_filter_alpha)
 
     robot.connect()
     try:
@@ -226,6 +264,7 @@ def main() -> None:
         latest_client_timing: dict[str, float] = {}
         raw_chunk_len = 0
         executed_chunk_len = 0
+        previous_executed_action: np.ndarray | None = None
 
         while time.perf_counter() - start_t < args.duration_s:
             loop_start_t = time.perf_counter()
@@ -237,6 +276,7 @@ def main() -> None:
             chunk_extract_ms = 0.0
             action_send_ms = 0.0
             clamp_ms = 0.0
+            filter_ms = 0.0
 
             if pending_actions is None or pending_action_index >= len(pending_actions):
                 capture_start_t = time.perf_counter()
@@ -326,6 +366,21 @@ def main() -> None:
                 max_abs_gripper_delta=args.max_abs_gripper_delta,
             )
             clamp_ms = (time.perf_counter() - clamp_start_t) * 1000
+
+            filter_start_t = time.perf_counter()
+            filtered_action, was_filtered = _low_pass_action(
+                safe_action,
+                previous_executed_action,
+                alpha=args.action_filter_alpha,
+            )
+            filtered_action[args.hold_joint_index] = current_state[args.hold_joint_index]
+            final_action, was_reclamped = _clamp_action_delta(
+                filtered_action,
+                current_state,
+                max_abs_joint_delta=args.max_abs_joint_delta,
+                max_abs_gripper_delta=args.max_abs_gripper_delta,
+            )
+            filter_ms = (time.perf_counter() - filter_start_t) * 1000
             if was_clamped:
                 logging.warning(
                     "step=%s action clamp triggered | current_state=%s raw_action=%s safe_action=%s",
@@ -334,17 +389,35 @@ def main() -> None:
                     action.tolist(),
                     safe_action.tolist(),
                 )
-
-            action_send_start_t = time.perf_counter()
-            executed_action = robot.send_action(torch.tensor(safe_action, dtype=torch.float32))
-            action_send_ms = (time.perf_counter() - action_send_start_t) * 1000
-            executed_action = _to_numpy(executed_action).astype(np.float32)
-
-            if executed_action.shape == safe_action.shape and not np.allclose(executed_action, safe_action):
-                logging.warning(
-                    "step=%s robot-level action clip triggered | safe_action=%s executed_action=%s",
+            if was_filtered and not np.allclose(filtered_action, safe_action):
+                logging.debug(
+                    "step=%s action filter applied | safe_action=%s filtered_action=%s",
                     step_idx,
                     safe_action.tolist(),
+                    filtered_action.tolist(),
+                )
+            if was_reclamped and not np.allclose(final_action, filtered_action):
+                logging.warning(
+                    "step=%s filtered action clamp triggered | filtered_action=%s final_action=%s",
+                    step_idx,
+                    filtered_action.tolist(),
+                    final_action.tolist(),
+                )
+
+            action_send_start_t = time.perf_counter()
+            executed_action = robot.send_action(torch.tensor(final_action, dtype=torch.float32))
+            action_send_ms = (time.perf_counter() - action_send_start_t) * 1000
+            executed_action = _to_numpy(executed_action).astype(np.float32)
+            if executed_action.shape == final_action.shape:
+                previous_executed_action = np.array(executed_action, copy=True)
+            else:
+                previous_executed_action = np.array(final_action, copy=True)
+
+            if executed_action.shape == final_action.shape and not np.allclose(executed_action, final_action):
+                logging.warning(
+                    "step=%s robot-level action clip triggered | final_action=%s executed_action=%s",
+                    step_idx,
+                    final_action.tolist(),
                     executed_action.tolist(),
                 )
 
@@ -372,7 +445,7 @@ def main() -> None:
                 "flow_prefix_image_embed_ms=%s flow_prompt_embed_ms=%s flow_prefix_concat_ms=%s "
                 "flow_prefix_embed_ms=%s "
                 "flow_prefix_prefill_ms=%s flow_loop_ms=%s flow_total_ms=%s "
-                "network_overhead_ms=%s chunk_extract_ms=%.2f clamp_ms=%.2f action_send_ms=%.2f",
+                "network_overhead_ms=%s chunk_extract_ms=%.2f clamp_ms=%.2f filter_ms=%.2f action_send_ms=%.2f",
                 step_idx,
                 chunk_step,
                 chunk_size,
@@ -400,6 +473,7 @@ def main() -> None:
                 network_overhead_ms,
                 latest_client_timing.get("chunk_extract_ms", chunk_extract_ms),
                 clamp_ms,
+                filter_ms,
                 action_send_ms,
             )
 

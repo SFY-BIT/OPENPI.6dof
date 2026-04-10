@@ -1,9 +1,71 @@
+import argparse
 import dataclasses
 import enum
 import logging
+import os
 import socket
+import sys
 
 import tyro
+
+
+def _parse_bool_flag(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
+
+
+def _apply_jax_runtime_env(argv: list[str]) -> tuple[list[str], dict[str, str]]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--jax-cuda-visible-devices",
+        type=str,
+        default=None,
+        help="Value to export to CUDA_VISIBLE_DEVICES before JAX is imported.",
+    )
+    parser.add_argument(
+        "--jax-preallocate",
+        type=_parse_bool_flag,
+        default=None,
+        help="Whether to export XLA_PYTHON_CLIENT_PREALLOCATE before JAX is imported.",
+    )
+    parser.add_argument(
+        "--jax-mem-fraction",
+        type=float,
+        default=None,
+        help="Optional XLA_PYTHON_CLIENT_MEM_FRACTION value to cap JAX GPU memory preallocation.",
+    )
+    parser.add_argument(
+        "--jax-allocator",
+        choices=("default", "platform"),
+        default=None,
+        help="Optional XLA_PYTHON_CLIENT_ALLOCATOR value. 'platform' uses on-demand allocation.",
+    )
+    early_args, remaining = parser.parse_known_args(argv)
+
+    applied_settings: dict[str, str] = {}
+    if early_args.jax_cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = early_args.jax_cuda_visible_devices
+        applied_settings["CUDA_VISIBLE_DEVICES"] = early_args.jax_cuda_visible_devices
+    if early_args.jax_preallocate is not None:
+        value = "true" if early_args.jax_preallocate else "false"
+        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = value
+        applied_settings["XLA_PYTHON_CLIENT_PREALLOCATE"] = value
+    if early_args.jax_mem_fraction is not None:
+        value = str(early_args.jax_mem_fraction)
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = value
+        applied_settings["XLA_PYTHON_CLIENT_MEM_FRACTION"] = value
+    if early_args.jax_allocator is not None and early_args.jax_allocator != "default":
+        os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = early_args.jax_allocator
+        applied_settings["XLA_PYTHON_CLIENT_ALLOCATOR"] = early_args.jax_allocator
+
+    return remaining, applied_settings
+
+
+_REMAINING_ARGV, _APPLIED_JAX_ENV = _apply_jax_runtime_env(sys.argv[1:])
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
@@ -101,6 +163,9 @@ def create_policy(args: Args) -> _policy.Policy:
 
 
 def main(args: Args) -> None:
+    if _APPLIED_JAX_ENV:
+        logging.info("Applied JAX runtime env overrides: %s", _APPLIED_JAX_ENV)
+
     policy = create_policy(args)
     policy_metadata = policy.metadata
 
@@ -123,4 +188,4 @@ def main(args: Args) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
-    main(tyro.cli(Args))
+    main(tyro.cli(Args, args=_REMAINING_ARGV))
