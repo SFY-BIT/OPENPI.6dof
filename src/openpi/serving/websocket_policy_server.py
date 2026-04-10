@@ -93,25 +93,18 @@ class WebsocketPolicyServer:
                 prev_total_time = total_ms / 1000
 
                 logger.info(
-                    "request_timing remote=%s recv_ms=%.2f unpack_ms=%.2f infer_ms=%.2f pack_ms=%.2f send_ms=%.2f total_ms=%.2f "
-                    "policy_total_ms=%s policy_input_transform_ms=%s policy_tensor_convert_ms=%s "
-                    "policy_observation_build_ms=%s policy_sample_dispatch_ms=%s policy_sample_sync_ms=%s "
-                    "policy_to_numpy_ms=%s policy_output_transform_ms=%s",
+                    "request_timing remote=%s infer_ms=%.2f policy_total_ms=%s "
+                    "flow_preprocess_ms=%s flow_noise_ms=%s flow_prefix_embed_ms=%s "
+                    "flow_prefix_prefill_ms=%s flow_loop_ms=%s flow_total_ms=%s",
                     websocket.remote_address,
-                    recv_ms,
-                    unpack_ms,
                     infer_ms,
-                    pack_ms,
-                    send_ms,
-                    total_ms,
                     action.get("policy_timing", {}).get("total_ms"),
-                    action.get("policy_timing", {}).get("input_transform_ms"),
-                    action.get("policy_timing", {}).get("tensor_convert_ms"),
-                    action.get("policy_timing", {}).get("observation_build_ms"),
-                    action.get("policy_timing", {}).get("sample_dispatch_ms"),
-                    action.get("policy_timing", {}).get("sample_sync_ms"),
-                    action.get("policy_timing", {}).get("to_numpy_ms"),
-                    action.get("policy_timing", {}).get("output_transform_ms"),
+                    action.get("policy_timing", {}).get("flow_preprocess_ms"),
+                    action.get("policy_timing", {}).get("flow_noise_ms"),
+                    action.get("policy_timing", {}).get("flow_prefix_embed_ms"),
+                    action.get("policy_timing", {}).get("flow_prefix_prefill_ms"),
+                    action.get("policy_timing", {}).get("flow_loop_ms"),
+                    action.get("policy_timing", {}).get("flow_total_ms"),
                 )
 
             except websockets.ConnectionClosed:

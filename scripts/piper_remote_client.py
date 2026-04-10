@@ -277,28 +277,23 @@ def main() -> None:
                 logging.info(
                     "Fetched action chunk from policy server raw_chunk_len=%s executed_chunk_len=%s "
                     "capture_ms=%.2f prepare_ms=%.2f policy_roundtrip_ms=%.2f chunk_extract_ms=%.2f "
-                    "server_recv_ms=%s server_unpack_ms=%s server_infer_ms=%s server_pack_ms=%s "
-                    "policy_total_ms=%s policy_input_transform_ms=%s policy_tensor_convert_ms=%s "
-                    "policy_observation_build_ms=%s policy_sample_dispatch_ms=%s policy_sample_sync_ms=%s "
-                    "policy_to_numpy_ms=%s policy_output_transform_ms=%s",
+                    "server_infer_ms=%s policy_total_ms=%s "
+                    "flow_preprocess_ms=%s flow_noise_ms=%s flow_prefix_embed_ms=%s "
+                    "flow_prefix_prefill_ms=%s flow_loop_ms=%s flow_total_ms=%s",
                     raw_chunk_len,
                     executed_chunk_len,
                     capture_ms,
                     prepare_ms,
                     policy_roundtrip_ms,
                     chunk_extract_ms,
-                    latest_server_timing.get("recv_ms"),
-                    latest_server_timing.get("unpack_ms"),
                     latest_server_timing.get("infer_ms"),
-                    latest_server_timing.get("pack_ms"),
                     latest_policy_timing.get("total_ms"),
-                    latest_policy_timing.get("input_transform_ms"),
-                    latest_policy_timing.get("tensor_convert_ms"),
-                    latest_policy_timing.get("observation_build_ms"),
-                    latest_policy_timing.get("sample_dispatch_ms"),
-                    latest_policy_timing.get("sample_sync_ms"),
-                    latest_policy_timing.get("to_numpy_ms"),
-                    latest_policy_timing.get("output_transform_ms"),
+                    latest_policy_timing.get("flow_preprocess_ms"),
+                    latest_policy_timing.get("flow_noise_ms"),
+                    latest_policy_timing.get("flow_prefix_embed_ms"),
+                    latest_policy_timing.get("flow_prefix_prefill_ms"),
+                    latest_policy_timing.get("flow_loop_ms"),
+                    latest_policy_timing.get("flow_total_ms"),
                 )
             else:
                 read_state_start_t = time.perf_counter()
@@ -371,10 +366,9 @@ def main() -> None:
                 "step=%s chunk_step=%s/%s infer_requested=%s raw_chunk_len=%s executed_chunk_len=%s "
                 "cycle_ms=%.2f effective_hz=%.2f loop_compute_ms=%.2f sleep_ms=%.2f "
                 "capture_ms=%.2f prepare_ms=%.2f read_state_ms=%.2f policy_roundtrip_ms=%.2f "
-                "server_recv_ms=%s server_unpack_ms=%s server_infer_ms=%s server_pack_ms=%s server_total_ms=%s "
-                "policy_ms=%s policy_total_ms=%s policy_input_transform_ms=%s policy_tensor_convert_ms=%s "
-                "policy_observation_build_ms=%s policy_sample_dispatch_ms=%s policy_sample_sync_ms=%s "
-                "policy_to_numpy_ms=%s policy_output_transform_ms=%s "
+                "server_infer_ms=%s policy_ms=%s policy_total_ms=%s "
+                "flow_preprocess_ms=%s flow_noise_ms=%s flow_prefix_embed_ms=%s "
+                "flow_prefix_prefill_ms=%s flow_loop_ms=%s flow_total_ms=%s "
                 "network_overhead_ms=%s chunk_extract_ms=%.2f clamp_ms=%.2f action_send_ms=%.2f",
                 step_idx,
                 chunk_step,
@@ -390,20 +384,15 @@ def main() -> None:
                 latest_client_timing.get("prepare_ms", prepare_ms),
                 read_state_ms,
                 latest_client_timing.get("policy_roundtrip_ms", policy_roundtrip_ms),
-                latest_server_timing.get("recv_ms"),
-                latest_server_timing.get("unpack_ms"),
                 latest_server_timing.get("infer_ms"),
-                latest_server_timing.get("pack_ms"),
-                latest_server_timing.get("total_ms"),
                 latest_policy_timing.get("infer_ms"),
                 latest_policy_timing.get("total_ms"),
-                latest_policy_timing.get("input_transform_ms"),
-                latest_policy_timing.get("tensor_convert_ms"),
-                latest_policy_timing.get("observation_build_ms"),
-                latest_policy_timing.get("sample_dispatch_ms"),
-                latest_policy_timing.get("sample_sync_ms"),
-                latest_policy_timing.get("to_numpy_ms"),
-                latest_policy_timing.get("output_transform_ms"),
+                latest_policy_timing.get("flow_preprocess_ms"),
+                latest_policy_timing.get("flow_noise_ms"),
+                latest_policy_timing.get("flow_prefix_embed_ms"),
+                latest_policy_timing.get("flow_prefix_prefill_ms"),
+                latest_policy_timing.get("flow_loop_ms"),
+                latest_policy_timing.get("flow_total_ms"),
                 network_overhead_ms,
                 latest_client_timing.get("chunk_extract_ms", chunk_extract_ms),
                 clamp_ms,
