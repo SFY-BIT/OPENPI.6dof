@@ -130,6 +130,30 @@ def _low_pass_action(
     return filtered, not np.allclose(filtered, target_action)
 
 
+def _suppress_small_action_update(
+    target_action: np.ndarray,
+    previous_action: np.ndarray | None,
+    *,
+    min_abs_joint_change: float | None,
+    min_abs_gripper_change: float | None,
+) -> tuple[np.ndarray, bool]:
+    if previous_action is None:
+        return np.array(target_action, copy=True), False
+    if target_action.shape != previous_action.shape:
+        raise ValueError(
+            f"Target action shape {target_action.shape} does not match previous action shape {previous_action.shape}"
+        )
+
+    gripper_index = target_action.shape[0] - 1
+    for idx, (target_value, previous_value) in enumerate(zip(target_action, previous_action, strict=True)):
+        min_delta = min_abs_gripper_change if idx == gripper_index else min_abs_joint_change
+        min_delta = 0.0 if min_delta is None else float(min_delta)
+        if abs(float(target_value) - float(previous_value)) > min_delta:
+            return np.array(target_action, copy=True), False
+
+    return np.array(previous_action, copy=True), True
+
+
 def _build_policy_observation(
     observation: dict[str, Any],
     task: str,
@@ -222,6 +246,24 @@ def _parse_args() -> argparse.Namespace:
             "Use a value in (0, 1]; smaller values are smoother, 1 disables filtering."
         ),
     )
+    parser.add_argument(
+        "--min-abs-joint-action-change",
+        type=float,
+        default=0.002,
+        help=(
+            "Skip sending the action if every non-gripper joint changes by no more than this amount "
+            "relative to the previously executed action. Set to 0 to disable joint deadband."
+        ),
+    )
+    parser.add_argument(
+        "--min-abs-gripper-action-change",
+        type=float,
+        default=0.002,
+        help=(
+            "Skip sending the action if the gripper change is no more than this amount "
+            "relative to the previously executed action. Set to 0 to disable gripper deadband."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -229,6 +271,14 @@ def main() -> None:
     args = _parse_args()
     if not 0.0 <= args.action_filter_alpha <= 1.0:
         raise ValueError(f"--action-filter-alpha must be in [0, 1], got {args.action_filter_alpha}")
+    if args.min_abs_joint_action_change < 0.0:
+        raise ValueError(
+            f"--min-abs-joint-action-change must be >= 0, got {args.min_abs_joint_action_change}"
+        )
+    if args.min_abs_gripper_action_change < 0.0:
+        raise ValueError(
+            f"--min-abs-gripper-action-change must be >= 0, got {args.min_abs_gripper_action_change}"
+        )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -252,6 +302,11 @@ def main() -> None:
         )
     else:
         logging.info("Low-pass action filter disabled (alpha=%.3f).", args.action_filter_alpha)
+    logging.info(
+        "Small-action suppression enabled with joint_deadband=%.4f gripper_deadband=%.4f.",
+        args.min_abs_joint_action_change,
+        args.min_abs_gripper_action_change,
+    )
 
     robot.connect()
     try:
@@ -277,6 +332,7 @@ def main() -> None:
             action_send_ms = 0.0
             clamp_ms = 0.0
             filter_ms = 0.0
+            action_suppressed = False
 
             if pending_actions is None or pending_action_index >= len(pending_actions):
                 capture_start_t = time.perf_counter()
@@ -404,20 +460,40 @@ def main() -> None:
                     final_action.tolist(),
                 )
 
-            action_send_start_t = time.perf_counter()
-            executed_action = robot.send_action(torch.tensor(final_action, dtype=torch.float32))
-            action_send_ms = (time.perf_counter() - action_send_start_t) * 1000
-            executed_action = _to_numpy(executed_action).astype(np.float32)
-            if executed_action.shape == final_action.shape:
+            debounced_action, action_suppressed = _suppress_small_action_update(
+                final_action,
+                previous_executed_action,
+                min_abs_joint_change=args.min_abs_joint_action_change,
+                min_abs_gripper_change=args.min_abs_gripper_action_change,
+            )
+            if action_suppressed:
+                executed_action = np.array(previous_executed_action, copy=True)
+                logging.debug(
+                    "step=%s action suppressed by deadband | previous_action=%s candidate_action=%s",
+                    step_idx,
+                    previous_executed_action.tolist() if previous_executed_action is not None else None,
+                    final_action.tolist(),
+                )
+            else:
+                action_send_start_t = time.perf_counter()
+                executed_action = robot.send_action(torch.tensor(debounced_action, dtype=torch.float32))
+                action_send_ms = (time.perf_counter() - action_send_start_t) * 1000
+                executed_action = _to_numpy(executed_action).astype(np.float32)
+
+            if executed_action.shape == debounced_action.shape:
                 previous_executed_action = np.array(executed_action, copy=True)
             else:
-                previous_executed_action = np.array(final_action, copy=True)
+                previous_executed_action = np.array(debounced_action, copy=True)
 
-            if executed_action.shape == final_action.shape and not np.allclose(executed_action, final_action):
+            if (
+                not action_suppressed
+                and executed_action.shape == debounced_action.shape
+                and not np.allclose(executed_action, debounced_action)
+            ):
                 logging.warning(
                     "step=%s robot-level action clip triggered | final_action=%s executed_action=%s",
                     step_idx,
-                    final_action.tolist(),
+                    debounced_action.tolist(),
                     executed_action.tolist(),
                 )
 
@@ -438,7 +514,7 @@ def main() -> None:
                 network_overhead_ms = policy_roundtrip_ms - float(latest_server_timing["infer_ms"])
 
             logging.info(
-                "step=%s chunk_step=%s/%s infer_requested=%s raw_chunk_len=%s executed_chunk_len=%s "
+                "step=%s chunk_step=%s/%s infer_requested=%s action_suppressed=%s raw_chunk_len=%s executed_chunk_len=%s "
                 "cycle_ms=%.2f effective_hz=%.2f loop_compute_ms=%.2f sleep_ms=%.2f "
                 "capture_ms=%.2f prepare_ms=%.2f read_state_ms=%.2f policy_roundtrip_ms=%.2f "
                 "server_infer_ms=%s policy_ms=%s policy_total_ms=%s "
@@ -450,6 +526,7 @@ def main() -> None:
                 chunk_step,
                 chunk_size,
                 infer_requested,
+                action_suppressed,
                 raw_chunk_len,
                 executed_chunk_len,
                 cycle_ms,
