@@ -223,32 +223,76 @@ def main() -> None:
         pending_action_index = 0
         latest_policy_timing: dict[str, Any] = {}
         latest_server_timing: dict[str, Any] = {}
+        latest_client_timing: dict[str, float] = {}
+        raw_chunk_len = 0
+        executed_chunk_len = 0
 
         while time.perf_counter() - start_t < args.duration_s:
             loop_start_t = time.perf_counter()
             infer_requested = False
+            capture_ms = 0.0
+            prepare_ms = 0.0
+            read_state_ms = 0.0
+            policy_roundtrip_ms = 0.0
+            chunk_extract_ms = 0.0
+            action_send_ms = 0.0
+            clamp_ms = 0.0
 
             if pending_actions is None or pending_action_index >= len(pending_actions):
+                capture_start_t = time.perf_counter()
                 observation = robot.capture_observation()
+                capture_ms = (time.perf_counter() - capture_start_t) * 1000
+
+                prepare_start_t = time.perf_counter()
                 policy_observation = _build_policy_observation(
                     observation,
                     args.task,
                     args.image_size,
                     args.expected_state_dim,
                 )
+                prepare_ms = (time.perf_counter() - prepare_start_t) * 1000
                 current_state = np.asarray(policy_observation["observation/state"], dtype=np.float32)
 
+                policy_start_t = time.perf_counter()
                 policy_result = policy.infer(policy_observation)
+                policy_roundtrip_ms = (time.perf_counter() - policy_start_t) * 1000
+
+                extract_start_t = time.perf_counter()
                 pending_actions = _extract_action_chunk(policy_result["actions"])
+                raw_chunk_len = len(pending_actions)
                 if args.chunk_execute_steps > 0:
                     pending_actions = pending_actions[: args.chunk_execute_steps]
+                executed_chunk_len = len(pending_actions)
+                chunk_extract_ms = (time.perf_counter() - extract_start_t) * 1000
                 pending_action_index = 0
                 latest_policy_timing = policy_result.get("policy_timing", {})
                 latest_server_timing = policy_result.get("server_timing", {})
+                latest_client_timing = {
+                    "capture_ms": capture_ms,
+                    "prepare_ms": prepare_ms,
+                    "policy_roundtrip_ms": policy_roundtrip_ms,
+                    "chunk_extract_ms": chunk_extract_ms,
+                }
                 infer_requested = True
-                logging.info("Fetched action chunk with %s steps from the policy server.", len(pending_actions))
+                logging.info(
+                    "Fetched action chunk from policy server raw_chunk_len=%s executed_chunk_len=%s "
+                    "capture_ms=%.2f prepare_ms=%.2f policy_roundtrip_ms=%.2f chunk_extract_ms=%.2f "
+                    "server_recv_ms=%s server_unpack_ms=%s server_infer_ms=%s server_pack_ms=%s",
+                    raw_chunk_len,
+                    executed_chunk_len,
+                    capture_ms,
+                    prepare_ms,
+                    policy_roundtrip_ms,
+                    chunk_extract_ms,
+                    latest_server_timing.get("recv_ms"),
+                    latest_server_timing.get("unpack_ms"),
+                    latest_server_timing.get("infer_ms"),
+                    latest_server_timing.get("pack_ms"),
+                )
             else:
+                read_state_start_t = time.perf_counter()
                 current_state = _read_current_state(robot, args.expected_state_dim)
+                read_state_ms = (time.perf_counter() - read_state_start_t) * 1000
 
             action = np.array(pending_actions[pending_action_index], copy=True)
             chunk_step = pending_action_index + 1
@@ -266,12 +310,14 @@ def main() -> None:
                 )
             action[args.hold_joint_index] = current_state[args.hold_joint_index]
 
+            clamp_start_t = time.perf_counter()
             safe_action, was_clamped = _clamp_action_delta(
                 action,
                 current_state,
                 max_abs_joint_delta=args.max_abs_joint_delta,
                 max_abs_gripper_delta=args.max_abs_gripper_delta,
             )
+            clamp_ms = (time.perf_counter() - clamp_start_t) * 1000
             if was_clamped:
                 logging.warning(
                     "step=%s action clamp triggered | current_state=%s raw_action=%s safe_action=%s",
@@ -281,22 +327,10 @@ def main() -> None:
                     safe_action.tolist(),
                 )
 
+            action_send_start_t = time.perf_counter()
             executed_action = robot.send_action(torch.tensor(safe_action, dtype=torch.float32))
+            action_send_ms = (time.perf_counter() - action_send_start_t) * 1000
             executed_action = _to_numpy(executed_action).astype(np.float32)
-
-            loop_dt_ms = (time.perf_counter() - loop_start_t) * 1000
-            control_hz = 1000.0 / loop_dt_ms if loop_dt_ms > 0 else float("inf")
-            logging.info(
-                "step=%s chunk_step=%s/%s infer_requested=%s loop_dt_ms=%.2f control_hz=%.2f server_ms=%s policy_ms=%s",
-                step_idx,
-                chunk_step,
-                chunk_size,
-                infer_requested,
-                loop_dt_ms,
-                control_hz,
-                latest_server_timing.get("infer_ms"),
-                latest_policy_timing.get("infer_ms"),
-            )
 
             if executed_action.shape == safe_action.shape and not np.allclose(executed_action, safe_action):
                 logging.warning(
@@ -307,10 +341,52 @@ def main() -> None:
                 )
 
             elapsed_s = time.perf_counter() - loop_start_t
+            sleep_s = 0.0
             if args.fps > 0:
                 sleep_s = max(0.0, (1.0 / args.fps) - elapsed_s)
                 if sleep_s > 0:
                     time.sleep(sleep_s)
+
+            loop_compute_ms = elapsed_s * 1000
+            cycle_ms = (time.perf_counter() - loop_start_t) * 1000
+            effective_hz = 1000.0 / cycle_ms if cycle_ms > 0 else float("inf")
+            network_overhead_ms = None
+            if infer_requested and latest_server_timing.get("total_ms") is not None:
+                network_overhead_ms = policy_roundtrip_ms - float(latest_server_timing["total_ms"])
+            elif infer_requested and latest_server_timing.get("infer_ms") is not None:
+                network_overhead_ms = policy_roundtrip_ms - float(latest_server_timing["infer_ms"])
+
+            logging.info(
+                "step=%s chunk_step=%s/%s infer_requested=%s raw_chunk_len=%s executed_chunk_len=%s "
+                "cycle_ms=%.2f effective_hz=%.2f loop_compute_ms=%.2f sleep_ms=%.2f "
+                "capture_ms=%.2f prepare_ms=%.2f read_state_ms=%.2f policy_roundtrip_ms=%.2f "
+                "server_recv_ms=%s server_unpack_ms=%s server_infer_ms=%s server_pack_ms=%s server_total_ms=%s "
+                "policy_ms=%s network_overhead_ms=%s chunk_extract_ms=%.2f clamp_ms=%.2f action_send_ms=%.2f",
+                step_idx,
+                chunk_step,
+                chunk_size,
+                infer_requested,
+                raw_chunk_len,
+                executed_chunk_len,
+                cycle_ms,
+                effective_hz,
+                loop_compute_ms,
+                sleep_s * 1000,
+                latest_client_timing.get("capture_ms", capture_ms),
+                latest_client_timing.get("prepare_ms", prepare_ms),
+                read_state_ms,
+                latest_client_timing.get("policy_roundtrip_ms", policy_roundtrip_ms),
+                latest_server_timing.get("recv_ms"),
+                latest_server_timing.get("unpack_ms"),
+                latest_server_timing.get("infer_ms"),
+                latest_server_timing.get("pack_ms"),
+                latest_server_timing.get("total_ms"),
+                latest_policy_timing.get("infer_ms"),
+                network_overhead_ms,
+                latest_client_timing.get("chunk_extract_ms", chunk_extract_ms),
+                clamp_ms,
+                action_send_ms,
+            )
 
             step_idx += 1
     finally:

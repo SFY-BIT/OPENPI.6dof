@@ -57,21 +57,51 @@ class WebsocketPolicyServer:
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                recv_start = time.monotonic()
+                request = await websocket.recv()
+                recv_ms = (time.monotonic() - recv_start) * 1000
 
-                infer_time = time.monotonic()
+                unpack_start = time.monotonic()
+                obs = msgpack_numpy.unpackb(request)
+                unpack_ms = (time.monotonic() - unpack_start) * 1000
+
+                infer_start = time.monotonic()
                 action = self._policy.infer(obs)
-                infer_time = time.monotonic() - infer_time
+                infer_ms = (time.monotonic() - infer_start) * 1000
 
                 action["server_timing"] = {
-                    "infer_ms": infer_time * 1000,
+                    "recv_ms": recv_ms,
+                    "unpack_ms": unpack_ms,
+                    "infer_ms": infer_ms,
                 }
                 if prev_total_time is not None:
                     # We can only record the last total time since we also want to include the send time.
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
 
-                await websocket.send(packer.pack(action))
-                prev_total_time = time.monotonic() - start_time
+                pack_start = time.monotonic()
+                packed_action = packer.pack(action)
+                pack_ms = (time.monotonic() - pack_start) * 1000
+                action["server_timing"]["pack_ms"] = pack_ms
+                packed_action = packer.pack(action)
+
+                send_start = time.monotonic()
+                await websocket.send(packed_action)
+                send_ms = (time.monotonic() - send_start) * 1000
+                total_ms = (time.monotonic() - start_time) * 1000
+                action["server_timing"]["send_ms"] = send_ms
+                action["server_timing"]["total_ms"] = total_ms
+                prev_total_time = total_ms / 1000
+
+                logger.info(
+                    "request_timing remote=%s recv_ms=%.2f unpack_ms=%.2f infer_ms=%.2f pack_ms=%.2f send_ms=%.2f total_ms=%.2f",
+                    websocket.remote_address,
+                    recv_ms,
+                    unpack_ms,
+                    infer_ms,
+                    pack_ms,
+                    send_ms,
+                    total_ms,
+                )
 
             except websockets.ConnectionClosed:
                 logger.info(f"Connection from {websocket.remote_address} closed")
