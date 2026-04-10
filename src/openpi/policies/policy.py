@@ -67,13 +67,15 @@ class Policy(BasePolicy):
             self._has_flow_breakdown = all(
                 hasattr(model, name)
                 for name in (
-                    "sample_actions_embed_prefix",
+                    "sample_actions_embed_image",
+                    "sample_actions_embed_prompt",
                     "sample_actions_prefix_prefill",
                     "sample_actions_flow_loop",
                 )
             )
             if self._has_flow_breakdown:
-                self._sample_actions_embed_prefix = nnx_utils.module_jit(model.sample_actions_embed_prefix)
+                self._sample_actions_embed_image = nnx_utils.module_jit(model.sample_actions_embed_image)
+                self._sample_actions_embed_prompt = nnx_utils.module_jit(model.sample_actions_embed_prompt)
                 self._sample_actions_prefix_prefill = nnx_utils.module_jit(model.sample_actions_prefix_prefill)
                 self._sample_actions_flow_loop = nnx_utils.module_jit(model.sample_actions_flow_loop)
 
@@ -104,18 +106,16 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
 
-        flow_preprocess_ms = None
-        flow_noise_ms = None
+        flow_prefix_image_embed_ms = None
+        flow_prompt_embed_ms = None
+        flow_prefix_concat_ms = None
         flow_prefix_embed_ms = None
         flow_prefix_prefill_ms = None
         flow_loop_ms = None
 
         if not self._is_pytorch_model and self._has_flow_breakdown:
-            flow_preprocess_start = time.monotonic()
+            sample_start = time.monotonic()
             flow_observation = _model.preprocess_observation(None, observation, train=False)
-            flow_preprocess_ms = (time.monotonic() - flow_preprocess_start) * 1000
-
-            flow_noise_start = time.monotonic()
             flow_num_steps = sample_kwargs.get("num_steps", 10)
             flow_noise = sample_kwargs.get("noise")
             if flow_noise is None:
@@ -124,12 +124,48 @@ class Policy(BasePolicy):
                     (flow_observation.state.shape[0], self._model.action_horizon, self._model.action_dim),
                 )
             flow_noise = jax.block_until_ready(flow_noise)
-            flow_noise_ms = (time.monotonic() - flow_noise_start) * 1000
 
-            flow_prefix_embed_start = time.monotonic()
-            prefix_tokens, prefix_mask, prefix_ar_mask = self._sample_actions_embed_prefix(flow_observation)
+            image_tokens_parts = []
+            image_mask_parts = []
+            image_ar_mask_parts = []
+            flow_prefix_image_embed_ms = 0.0
+            for name, image in flow_observation.images.items():
+                image_embed_start = time.monotonic()
+                image_tokens = self._sample_actions_embed_image(image)
+                image_tokens = jax.block_until_ready(image_tokens)
+                flow_prefix_image_embed_ms += (time.monotonic() - image_embed_start) * 1000
+
+                image_tokens_parts.append(image_tokens)
+                image_mask_parts.append(jnp.broadcast_to(flow_observation.image_masks[name][:, None], image_tokens.shape[:2]))
+                image_ar_mask_parts.append(jnp.zeros((image_tokens.shape[1],), dtype=jnp.bool_))
+
+            prompt_tokens = None
+            prompt_mask = None
+            prompt_ar_mask = None
+            flow_prompt_embed_ms = 0.0
+            if flow_observation.tokenized_prompt is not None:
+                prompt_embed_start = time.monotonic()
+                prompt_tokens = self._sample_actions_embed_prompt(flow_observation.tokenized_prompt)
+                prompt_tokens = jax.block_until_ready(prompt_tokens)
+                flow_prompt_embed_ms = (time.monotonic() - prompt_embed_start) * 1000
+
+                prompt_mask = flow_observation.tokenized_prompt_mask
+                prompt_ar_mask = jnp.zeros((prompt_tokens.shape[1],), dtype=jnp.bool_)
+
+            flow_prefix_concat_start = time.monotonic()
+            prefix_token_parts = list(image_tokens_parts)
+            prefix_mask_parts = list(image_mask_parts)
+            prefix_ar_parts = list(image_ar_mask_parts)
+            if prompt_tokens is not None and prompt_mask is not None and prompt_ar_mask is not None:
+                prefix_token_parts.append(prompt_tokens)
+                prefix_mask_parts.append(prompt_mask)
+                prefix_ar_parts.append(prompt_ar_mask)
+            prefix_tokens = jnp.concatenate(prefix_token_parts, axis=1)
+            prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+            prefix_ar_mask = jnp.concatenate(prefix_ar_parts, axis=0)
             prefix_tokens, prefix_mask, prefix_ar_mask = jax.block_until_ready((prefix_tokens, prefix_mask, prefix_ar_mask))
-            flow_prefix_embed_ms = (time.monotonic() - flow_prefix_embed_start) * 1000
+            flow_prefix_concat_ms = (time.monotonic() - flow_prefix_concat_start) * 1000
+            flow_prefix_embed_ms = flow_prefix_image_embed_ms + flow_prompt_embed_ms + flow_prefix_concat_ms
 
             flow_prefix_prefill_start = time.monotonic()
             prefix_mask, kv_cache = self._sample_actions_prefix_prefill(prefix_tokens, prefix_mask, prefix_ar_mask)
@@ -146,7 +182,7 @@ class Policy(BasePolicy):
             )
             sampled_actions = jax.block_until_ready(sampled_actions)
             flow_loop_ms = (time.monotonic() - flow_loop_start) * 1000
-            sample_total_ms = flow_preprocess_ms + flow_noise_ms + flow_prefix_embed_ms + flow_prefix_prefill_ms + flow_loop_ms
+            sample_total_ms = (time.monotonic() - sample_start) * 1000
         else:
             sample_start = time.monotonic()
             sampled_actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
@@ -172,12 +208,17 @@ class Policy(BasePolicy):
         total_ms = (time.monotonic() - total_start) * 1000
         outputs["policy_timing"] = {
             "infer_ms": sample_total_ms,
-            "flow_preprocess_ms": flow_preprocess_ms,
-            "flow_noise_ms": flow_noise_ms,
+            "flow_prefix_image_embed_ms": flow_prefix_image_embed_ms,
+            "flow_prompt_embed_ms": flow_prompt_embed_ms,
+            "flow_prefix_concat_ms": flow_prefix_concat_ms,
             "flow_prefix_embed_ms": flow_prefix_embed_ms,
             "flow_prefix_prefill_ms": flow_prefix_prefill_ms,
             "flow_loop_ms": flow_loop_ms,
-            "flow_total_ms": sample_total_ms if flow_preprocess_ms is not None else None,
+            "flow_total_ms": (
+                flow_prefix_embed_ms + flow_prefix_prefill_ms + flow_loop_ms
+                if flow_prefix_embed_ms is not None and flow_prefix_prefill_ms is not None and flow_loop_ms is not None
+                else None
+            ),
             "total_ms": total_ms,
         }
         return outputs

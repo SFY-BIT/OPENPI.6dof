@@ -94,13 +94,15 @@ class WebsocketPolicyServer:
 
                 logger.info(
                     "request_timing remote=%s infer_ms=%.2f policy_total_ms=%s "
-                    "flow_preprocess_ms=%s flow_noise_ms=%s flow_prefix_embed_ms=%s "
+                    "flow_prefix_image_embed_ms=%s flow_prompt_embed_ms=%s flow_prefix_concat_ms=%s "
+                    "flow_prefix_embed_ms=%s "
                     "flow_prefix_prefill_ms=%s flow_loop_ms=%s flow_total_ms=%s",
                     websocket.remote_address,
                     infer_ms,
                     action.get("policy_timing", {}).get("total_ms"),
-                    action.get("policy_timing", {}).get("flow_preprocess_ms"),
-                    action.get("policy_timing", {}).get("flow_noise_ms"),
+                    action.get("policy_timing", {}).get("flow_prefix_image_embed_ms"),
+                    action.get("policy_timing", {}).get("flow_prompt_embed_ms"),
+                    action.get("policy_timing", {}).get("flow_prefix_concat_ms"),
                     action.get("policy_timing", {}).get("flow_prefix_embed_ms"),
                     action.get("policy_timing", {}).get("flow_prefix_prefill_ms"),
                     action.get("policy_timing", {}).get("flow_loop_ms"),

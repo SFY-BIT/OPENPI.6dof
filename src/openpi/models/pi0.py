@@ -139,7 +139,7 @@ class Pi0(_model.BaseModel):
         tokens = []
         # embed images
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_tokens = self.sample_actions_embed_image(obs.images[name])
             _debug_nonfinite_tensor(f"image_tokens[{name}]", image_tokens)
 
             tokens.append(image_tokens)
@@ -155,7 +155,7 @@ class Pi0(_model.BaseModel):
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokenized_inputs = self.sample_actions_embed_prompt(obs.tokenized_prompt)
             _debug_nonfinite_tensor("tokenized_inputs", tokenized_inputs)
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
@@ -280,6 +280,13 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.sample_actions_embed_prefix(observation)
         prefix_mask, kv_cache = self.sample_actions_prefix_prefill(prefix_tokens, prefix_mask, prefix_ar_mask)
         return self.sample_actions_flow_loop(observation, prefix_mask, kv_cache, noise, num_steps=num_steps)
+
+    def sample_actions_embed_image(self, image):
+        image_tokens, _ = self.PaliGemma.img(image, train=False)
+        return image_tokens
+
+    def sample_actions_embed_prompt(self, tokenized_prompt):
+        return self.PaliGemma.llm(tokenized_prompt, method="embed")
 
     def sample_actions_embed_prefix(
         self, observation: _model.Observation
