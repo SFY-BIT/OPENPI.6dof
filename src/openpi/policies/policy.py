@@ -66,9 +66,18 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        total_start = time.monotonic()
+
         # Make a copy since transformations may modify the inputs in place.
+        input_copy_start = time.monotonic()
         inputs = jax.tree.map(lambda x: x, obs)
+        input_copy_ms = (time.monotonic() - input_copy_start) * 1000
+
+        input_transform_start = time.monotonic()
         inputs = self._input_transform(inputs)
+        input_transform_ms = (time.monotonic() - input_transform_start) * 1000
+
+        tensor_convert_start = time.monotonic()
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -77,31 +86,64 @@ class Policy(BasePolicy):
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
+        tensor_convert_ms = (time.monotonic() - tensor_convert_start) * 1000
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        noise_prepare_start = time.monotonic()
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        noise_prepare_ms = (time.monotonic() - noise_prepare_start) * 1000
 
+        observation_build_start = time.monotonic()
         observation = _model.Observation.from_dict(inputs)
-        start_time = time.monotonic()
+        observation_build_ms = (time.monotonic() - observation_build_start) * 1000
+
+        sample_start = time.monotonic()
+        sampled_actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        sample_dispatch_ms = (time.monotonic() - sample_start) * 1000
+
+        sample_sync_start = time.monotonic()
+        if self._is_pytorch_model:
+            if hasattr(sampled_actions, "is_cuda") and sampled_actions.is_cuda:
+                torch.cuda.synchronize(device=sampled_actions.device)
+        else:
+            sampled_actions = jax.block_until_ready(sampled_actions)
+        sample_sync_ms = (time.monotonic() - sample_sync_start) * 1000
+
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": sampled_actions,
         }
-        model_time = time.monotonic() - start_time
+
+        to_numpy_start = time.monotonic()
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        to_numpy_ms = (time.monotonic() - to_numpy_start) * 1000
 
+        output_transform_start = time.monotonic()
         outputs = self._output_transform(outputs)
+        output_transform_ms = (time.monotonic() - output_transform_start) * 1000
+
+        total_ms = (time.monotonic() - total_start) * 1000
         outputs["policy_timing"] = {
-            "infer_ms": model_time * 1000,
+            "infer_ms": sample_dispatch_ms + sample_sync_ms,
+            "input_copy_ms": input_copy_ms,
+            "input_transform_ms": input_transform_ms,
+            "tensor_convert_ms": tensor_convert_ms,
+            "noise_prepare_ms": noise_prepare_ms,
+            "observation_build_ms": observation_build_ms,
+            "sample_dispatch_ms": sample_dispatch_ms,
+            "sample_sync_ms": sample_sync_ms,
+            "to_numpy_ms": to_numpy_ms,
+            "output_transform_ms": output_transform_ms,
+            "total_ms": total_ms,
         }
         return outputs
 
