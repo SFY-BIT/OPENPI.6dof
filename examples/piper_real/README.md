@@ -30,7 +30,8 @@ python scripts/piper_remote_client.py \
   --server-host <gpu-server-ip> \
   --server-port 8000 \
   --task "your task instruction" \
-  --fps 5
+  --fps 30 \
+  --policy-fps 5
 ```
 
 Running the client from the `lerobot` Python environment is usually the easiest path, because that environment already contains the Piper SDK and robot-side dependencies. The script injects the local `openpi-client` source tree automatically, so you do not need a full `openpi` install on the robot machine.
@@ -40,9 +41,17 @@ The client:
 - reads `observation.images.one` and `observation.images.two`
 - resizes them to `224 x 224`
 - sends them together with the 7-D joint state to the openpi server
-- takes the first action from the returned action chunk
+- receives the full returned action chunk from the server
+- replays that chunk locally at `--fps`, with fresh server replans at `--policy-fps`
+- linearly interpolates between chunk waypoints during local replay
 - replaces action dimension `3` with the current joint value for `joint3mask` execution
 - clamps per-step deltas before sending the command to Piper
+
+Parameter meanings:
+
+- `--fps`: local robot command rate on the robot machine
+- `--policy-fps`: remote replan rate against the openpi policy server
+- `--chunk-execute-steps`: optional cap on how many waypoints from each returned chunk are used during local replay; `0` uses the full chunk
 
 ## Notes
 

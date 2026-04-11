@@ -71,6 +71,35 @@ def _extract_action_chunk(action_chunk: Any) -> np.ndarray:
     return action_chunk
 
 
+def _select_chunk_waypoints(action_chunk: np.ndarray, max_waypoints: int) -> np.ndarray:
+    if action_chunk.ndim != 2:
+        raise ValueError(f"Expected 2-D action chunk, got shape {action_chunk.shape}")
+    if max_waypoints > 0:
+        action_chunk = action_chunk[:max_waypoints]
+    if len(action_chunk) == 0:
+        raise ValueError("Policy returned an empty action chunk.")
+    return action_chunk.astype(np.float32, copy=False)
+
+
+def _interpolate_chunk_action(action_chunk: np.ndarray, phase: float) -> np.ndarray:
+    if action_chunk.ndim != 2:
+        raise ValueError(f"Expected 2-D action chunk, got shape {action_chunk.shape}")
+    if len(action_chunk) == 0:
+        raise ValueError("Cannot interpolate an empty action chunk.")
+    if len(action_chunk) == 1:
+        return np.array(action_chunk[0], copy=True)
+
+    bounded_phase = float(np.clip(phase, 0.0, 1.0))
+    scaled_index = bounded_phase * float(len(action_chunk) - 1)
+    lower_index = int(np.floor(scaled_index))
+    upper_index = min(lower_index + 1, len(action_chunk) - 1)
+    mix = scaled_index - lower_index
+    if lower_index == upper_index:
+        return np.array(action_chunk[lower_index], copy=True)
+    interpolated = ((1.0 - mix) * action_chunk[lower_index]) + (mix * action_chunk[upper_index])
+    return interpolated.astype(np.float32, copy=False)
+
+
 def _read_current_state(robot: Any, expected_state_dim: int) -> np.ndarray:
     if not hasattr(robot, "arm") or not hasattr(robot.arm, "read"):
         raise AttributeError("Piper remote client expects the robot runtime to expose robot.arm.read().")
@@ -195,14 +224,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--server-host", default="127.0.0.1", help="Hostname or IP of the openpi policy server.")
     parser.add_argument("--server-port", type=int, default=8000, help="Port of the openpi policy server.")
     parser.add_argument("--task", required=True, help="Task prompt to send to the policy.")
-    parser.add_argument("--fps", type=float, default=5.0, help="Requested local control loop frequency.")
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=30.0,
+        help="Local robot command frequency. This is the actual command playback rate on the robot.",
+    )
+    parser.add_argument(
+        "--policy-fps",
+        type=float,
+        default=5.0,
+        help=(
+            "Policy inference frequency. A fresh observation is sent to the server at this rate, and the returned "
+            "action chunk is replayed locally between replans."
+        ),
+    )
     parser.add_argument("--duration-s", type=float, default=60.0, help="How long to run the control loop.")
     parser.add_argument("--robot-type", default="piper", help="Robot type exposed by lerobot.act.")
     parser.add_argument(
         "--chunk-execute-steps",
         type=int,
-        default=1,
-        help="Maximum number of actions to execute from each returned action chunk before refreshing from the server.",
+        default=0,
+        help=(
+            "Maximum number of waypoints to use from each returned action chunk during local replay. "
+            "Set to 0 to use the full chunk."
+        ),
     )
     parser.add_argument(
         "--image-size",
@@ -271,6 +317,10 @@ def main() -> None:
     args = _parse_args()
     if not 0.0 <= args.action_filter_alpha <= 1.0:
         raise ValueError(f"--action-filter-alpha must be in [0, 1], got {args.action_filter_alpha}")
+    if args.fps <= 0.0:
+        raise ValueError(f"--fps must be > 0, got {args.fps}")
+    if args.policy_fps <= 0.0:
+        raise ValueError(f"--policy-fps must be > 0, got {args.policy_fps}")
     if args.min_abs_joint_action_change < 0.0:
         raise ValueError(
             f"--min-abs-joint-action-change must be >= 0, got {args.min_abs_joint_action_change}"
@@ -292,8 +342,10 @@ def main() -> None:
         args.hold_joint_index,
     )
     logging.info(
-        "Action chunks will be executed sequentially before the next server inference request (max %s steps).",
-        args.chunk_execute_steps,
+        "Local replay configured with control_fps=%.2f policy_fps=%.2f max_waypoints=%s.",
+        args.fps,
+        args.policy_fps,
+        "full chunk" if args.chunk_execute_steps <= 0 else args.chunk_execute_steps,
     )
     if args.action_filter_alpha < 1.0:
         logging.info(
@@ -312,14 +364,15 @@ def main() -> None:
     try:
         start_t = time.perf_counter()
         step_idx = 0
-        pending_actions: np.ndarray | None = None
-        pending_action_index = 0
         latest_policy_timing: dict[str, Any] = {}
         latest_server_timing: dict[str, Any] = {}
-        latest_client_timing: dict[str, float] = {}
         raw_chunk_len = 0
-        executed_chunk_len = 0
+        replay_waypoint_count = 0
         previous_executed_action: np.ndarray | None = None
+        replay_waypoints: np.ndarray | None = None
+        replay_started_t: float | None = None
+        policy_period_s = 1.0 / args.policy_fps
+        next_policy_infer_t = start_t
 
         while time.perf_counter() - start_t < args.duration_s:
             loop_start_t = time.perf_counter()
@@ -333,8 +386,10 @@ def main() -> None:
             clamp_ms = 0.0
             filter_ms = 0.0
             action_suppressed = False
+            replay_phase = 0.0
+            replay_waypoint_idx = 1
 
-            if pending_actions is None or pending_action_index >= len(pending_actions):
+            if replay_waypoints is None or replay_started_t is None or loop_start_t >= next_policy_infer_t:
                 capture_start_t = time.perf_counter()
                 observation = robot.capture_observation()
                 capture_ms = (time.perf_counter() - capture_start_t) * 1000
@@ -354,31 +409,25 @@ def main() -> None:
                 policy_roundtrip_ms = (time.perf_counter() - policy_start_t) * 1000
 
                 extract_start_t = time.perf_counter()
-                pending_actions = _extract_action_chunk(policy_result["actions"])
-                raw_chunk_len = len(pending_actions)
-                if args.chunk_execute_steps > 0:
-                    pending_actions = pending_actions[: args.chunk_execute_steps]
-                executed_chunk_len = len(pending_actions)
+                raw_chunk = _extract_action_chunk(policy_result["actions"])
+                raw_chunk_len = len(raw_chunk)
+                replay_waypoints = _select_chunk_waypoints(raw_chunk, args.chunk_execute_steps)
+                replay_waypoint_count = len(replay_waypoints)
                 chunk_extract_ms = (time.perf_counter() - extract_start_t) * 1000
-                pending_action_index = 0
+                replay_started_t = time.perf_counter()
+                next_policy_infer_t = replay_started_t + policy_period_s
                 latest_policy_timing = policy_result.get("policy_timing", {})
                 latest_server_timing = policy_result.get("server_timing", {})
-                latest_client_timing = {
-                    "capture_ms": capture_ms,
-                    "prepare_ms": prepare_ms,
-                    "policy_roundtrip_ms": policy_roundtrip_ms,
-                    "chunk_extract_ms": chunk_extract_ms,
-                }
                 infer_requested = True
                 logging.info(
-                    "Fetched action chunk from policy server raw_chunk_len=%s executed_chunk_len=%s "
+                    "Fetched action chunk from policy server raw_chunk_len=%s replay_waypoints=%s "
                     "capture_ms=%.2f prepare_ms=%.2f policy_roundtrip_ms=%.2f chunk_extract_ms=%.2f "
                     "server_infer_ms=%s policy_total_ms=%s "
                     "flow_prefix_image_embed_ms=%s flow_prompt_embed_ms=%s flow_prefix_concat_ms=%s "
                     "flow_prefix_embed_ms=%s "
                     "flow_prefix_prefill_ms=%s flow_loop_ms=%s flow_total_ms=%s",
                     raw_chunk_len,
-                    executed_chunk_len,
+                    replay_waypoint_count,
                     capture_ms,
                     prepare_ms,
                     policy_roundtrip_ms,
@@ -398,10 +447,17 @@ def main() -> None:
                 current_state = _read_current_state(robot, args.expected_state_dim)
                 read_state_ms = (time.perf_counter() - read_state_start_t) * 1000
 
-            action = np.array(pending_actions[pending_action_index], copy=True)
-            chunk_step = pending_action_index + 1
-            chunk_size = len(pending_actions)
-            pending_action_index += 1
+            if replay_waypoints is None or replay_started_t is None:
+                raise RuntimeError("Action replay state was not initialized.")
+
+            replay_eval_t = time.perf_counter()
+            replay_phase = (replay_eval_t - replay_started_t) / policy_period_s
+            action = _interpolate_chunk_action(replay_waypoints, replay_phase)
+            chunk_size = len(replay_waypoints)
+            replay_waypoint_idx = min(
+                chunk_size,
+                int(np.floor(np.clip(replay_phase, 0.0, 1.0) * max(chunk_size - 1, 0))) + 1,
+            )
 
             if action.shape != current_state.shape:
                 raise ValueError(
@@ -514,7 +570,8 @@ def main() -> None:
                 network_overhead_ms = policy_roundtrip_ms - float(latest_server_timing["infer_ms"])
 
             logging.info(
-                "step=%s chunk_step=%s/%s infer_requested=%s action_suppressed=%s raw_chunk_len=%s executed_chunk_len=%s "
+                "step=%s replay_waypoint=%s/%s replay_phase=%.3f infer_requested=%s action_suppressed=%s "
+                "raw_chunk_len=%s replay_waypoints=%s "
                 "cycle_ms=%.2f effective_hz=%.2f loop_compute_ms=%.2f sleep_ms=%.2f "
                 "capture_ms=%.2f prepare_ms=%.2f read_state_ms=%.2f policy_roundtrip_ms=%.2f "
                 "server_infer_ms=%s policy_ms=%s policy_total_ms=%s "
@@ -523,20 +580,21 @@ def main() -> None:
                 "flow_prefix_prefill_ms=%s flow_loop_ms=%s flow_total_ms=%s "
                 "network_overhead_ms=%s chunk_extract_ms=%.2f clamp_ms=%.2f filter_ms=%.2f action_send_ms=%.2f",
                 step_idx,
-                chunk_step,
+                replay_waypoint_idx,
                 chunk_size,
+                replay_phase,
                 infer_requested,
                 action_suppressed,
                 raw_chunk_len,
-                executed_chunk_len,
+                replay_waypoint_count,
                 cycle_ms,
                 effective_hz,
                 loop_compute_ms,
                 sleep_s * 1000,
-                latest_client_timing.get("capture_ms", capture_ms),
-                latest_client_timing.get("prepare_ms", prepare_ms),
+                capture_ms,
+                prepare_ms,
                 read_state_ms,
-                latest_client_timing.get("policy_roundtrip_ms", policy_roundtrip_ms),
+                policy_roundtrip_ms,
                 latest_server_timing.get("infer_ms"),
                 latest_policy_timing.get("infer_ms"),
                 latest_policy_timing.get("total_ms"),
@@ -548,7 +606,7 @@ def main() -> None:
                 latest_policy_timing.get("flow_loop_ms"),
                 latest_policy_timing.get("flow_total_ms"),
                 network_overhead_ms,
-                latest_client_timing.get("chunk_extract_ms", chunk_extract_ms),
+                chunk_extract_ms,
                 clamp_ms,
                 filter_ms,
                 action_send_ms,
